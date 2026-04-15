@@ -119,3 +119,95 @@ export function geocode(
 export function clearGeoQueue() {
   queue = [];
 }
+
+// --- Reverse geocoding ---
+
+export interface ReverseResult {
+  displayName: string;
+  /** Short human-readable name: county, city, ZIP, etc. */
+  shortName: string;
+  /** Nominatim addresstype: 'administrative', 'postcode', 'city', etc. */
+  addresstype: string;
+  address: {
+    postcode?: string;
+    county?: string;
+    city?: string;
+    town?: string;
+    village?: string;
+    suburb?: string;
+    state?: string;
+    country?: string;
+    country_code?: string;
+  };
+}
+
+/**
+ * Reverse geocode a lat/lng using Nominatim.
+ * zoom=10 returns county-level granularity.
+ * Not rate-limited (called only on explicit user clicks).
+ */
+export async function reverseGeocode(lat: number, lng: number): Promise<ReverseResult | null> {
+  const url =
+    `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=10&addressdetails=1`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'Accept-Language': 'en', 'User-Agent': 'GeoTargetBuilder/1.0' },
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as {
+      display_name?: string;
+      name?: string;
+      addresstype?: string;
+      type?: string;
+      address?: ReverseResult['address'];
+    };
+    const addr = data.address ?? {};
+    const addresstype = data.addresstype ?? data.type ?? 'unknown';
+    const shortName =
+      data.name ||
+      addr.county ||
+      addr.city ||
+      addr.town ||
+      addr.suburb ||
+      addr.postcode ||
+      '';
+    return {
+      displayName: data.display_name ?? '',
+      shortName,
+      addresstype,
+      address: addr,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a location string in Google/Bing Ads format from a reverse geocode result.
+ * e.g. "Orange County, California, United States (county)"
+ */
+export function reverseResultToLocationString(r: ReverseResult): string {
+  const addr = r.address;
+  const state = addr.state ?? '';
+  const country = addr.country ?? '';
+
+  if (addr.postcode && r.addresstype === 'postcode') {
+    return [addr.postcode, state, country].filter(Boolean).join(', ');
+  }
+
+  const place =
+    addr.county ||
+    addr.city ||
+    addr.town ||
+    addr.village ||
+    addr.suburb ||
+    r.shortName;
+
+  const kind =
+    addr.county ? '(county)' :
+    addr.city ? '(city)' :
+    addr.suburb ? '(neighborhood)' :
+    '';
+
+  return [place, state, country].filter(Boolean).join(', ') + (kind ? ` ${kind}` : '');
+}
