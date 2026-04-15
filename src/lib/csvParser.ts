@@ -43,7 +43,9 @@ export interface RawRow {
  * We strip that prefix before processing.
  */
 export function parseCSVText(text: string): RawRow[] {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  // Strip BOM (Excel-generated UTF-8 CSVs start with \uFEFF)
+  const cleaned = text.replace(/^\uFEFF/, '');
+  const lines = cleaned.split('\n').map(l => l.trim()).filter(Boolean);
   if (lines.length < 2) return [];
 
   // Strip optional "[Resource from ...] " prefix on the header line
