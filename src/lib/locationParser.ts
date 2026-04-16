@@ -50,7 +50,8 @@ export function parseLocation(raw: string): ParsedLocation {
 
   const mZip = RE_ZIP.exec(s);
   if (mZip) {
-    return { kind: 'zip', raw: s, query: s };
+    // ZIP codes rendered as ~5-mile radius circles (visual approximation)
+    return { kind: 'zip', raw: s, query: s, radiusMiles: 5 };
   }
 
   return { kind: 'named', raw: s, query: s };
