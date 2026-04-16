@@ -1,16 +1,19 @@
 /**
  * Nominatim geocoder with:
- * - localStorage cache (geotarget_geocache_v2)
+ * - localStorage cache (geotarget_geocache_v3)
  * - 1200ms rate-limiting queue (Nominatim ToS: max 1 req/sec)
  * - version-based cancellation to avoid stale state updates
+ * - polygon_geojson support for zone rendering
  */
+import type { Geometry } from 'geojson';
 
-const CACHE_KEY = 'geotarget_geocache_v2';
+const CACHE_KEY = 'geotarget_geocache_v3';
 const RATE_LIMIT_MS = 1200;
 
 export interface GeoResult {
   lat: number;
   lng: number;
+  geom?: Geometry;
 }
 
 // --- Cache ---
@@ -31,19 +34,18 @@ function saveCache(cache: Map<string, GeoResult | null>) {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify(obj));
   } catch {
-    // Quota exceeded — clear old cache
     localStorage.removeItem(CACHE_KEY);
   }
 }
 
 const cache = loadCache();
 
-// --- Queue ---
+// --- Rate-limited queue ---
 let lastRequestTime = 0;
-let queue: Array<() => void> = [];
+let queue: Array<() => Promise<void>> = [];
 let processing = false;
 
-function enqueue(fn: () => void) {
+function enqueue(fn: () => Promise<void>) {
   queue.push(fn);
   if (!processing) drainQueue();
 }
@@ -56,9 +58,7 @@ async function drainQueue() {
     const wait = RATE_LIMIT_MS - (now - lastRequestTime);
     if (wait > 0) await sleep(wait);
     lastRequestTime = Date.now();
-    fn();
-    // Wait for fn to complete before next item — fn must return a promise
-    // We use a wrapper that resolves after the fetch
+    await fn();
   }
   processing = false;
 }
@@ -67,34 +67,38 @@ function sleep(ms: number) {
   return new Promise<void>(r => setTimeout(r, ms));
 }
 
-// --- Fetch ---
+// --- Forward geocode fetch (with polygon) ---
 async function fetchNominatim(query: string): Promise<GeoResult | null> {
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`;
+  const url =
+    `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}` +
+    `&format=json&limit=1&polygon_geojson=1&polygon_threshold=0.005&addressdetails=1`;
   try {
     const res = await fetch(url, {
       headers: { 'Accept-Language': 'en', 'User-Agent': 'GeoTargetBuilder/1.0' },
     });
     if (!res.ok) return null;
-    const data = await res.json() as Array<{ lat: string; lon: string }>;
-    if (data.length === 0) return null;
-    return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+    const data = await res.json() as Array<{
+      lat: string; lon: string; geojson?: Geometry;
+    }>;
+    if (!data.length) return null;
+    return {
+      lat: parseFloat(data[0].lat),
+      lng: parseFloat(data[0].lon),
+      geom: data[0].geojson,
+    };
   } catch {
     return null;
   }
 }
 
 /**
- * Geocode a text query. Returns null if not found.
- * Uses cache + rate-limited queue.
- * `versionRef` is an object whose `.current` value the caller increments to cancel stale calls.
- * `myVersion` is the value at call time; if they differ, resolve with null immediately.
+ * Geocode a text query with rate-limiting, caching, and version-abort support.
  */
 export function geocode(
   query: string,
   versionRef: { current: number },
   myVersion: number,
 ): Promise<GeoResult | null> {
-  // Cache hit
   if (cache.has(query)) {
     return Promise.resolve(cache.get(query) ?? null);
   }
@@ -115,19 +119,60 @@ export function geocode(
   });
 }
 
-/** Clear the geocoder queue (call when component unmounts or selection changes). */
 export function clearGeoQueue() {
   queue = [];
+}
+
+// --- Autocomplete search ---
+
+export interface NominatimSuggestion {
+  place_id: number;
+  display_name: string;
+  lat: string;
+  lon: string;
+  type: string;
+  addresstype?: string;
+  geojson?: Geometry;
+  address?: {
+    postcode?: string;
+    county?: string;
+    city?: string;
+    town?: string;
+    village?: string;
+    suburb?: string;
+    state?: string;
+    country?: string;
+    country_code?: string;
+  };
+}
+
+/**
+ * Search Nominatim for suggestions (for autocomplete).
+ * Not rate-limited — debounce in the caller.
+ */
+export async function searchNominatim(query: string, limit = 6): Promise<NominatimSuggestion[]> {
+  if (query.length < 2) return [];
+  const url =
+    `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}` +
+    `&format=json&limit=${limit}&polygon_geojson=1&polygon_threshold=0.005&addressdetails=1`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'Accept-Language': 'en', 'User-Agent': 'GeoTargetBuilder/1.0' },
+    });
+    if (!res.ok) return [];
+    return await res.json() as NominatimSuggestion[];
+  } catch {
+    return [];
+  }
 }
 
 // --- Reverse geocoding ---
 
 export interface ReverseResult {
   displayName: string;
-  /** Short human-readable name: county, city, ZIP, etc. */
   shortName: string;
-  /** Nominatim addresstype: 'administrative', 'postcode', 'city', etc. */
   addresstype: string;
+  geom?: Geometry;
   address: {
     postcode?: string;
     county?: string;
@@ -142,13 +187,17 @@ export interface ReverseResult {
 }
 
 /**
- * Reverse geocode a lat/lng using Nominatim.
- * zoom=10 returns county-level granularity.
- * Not rate-limited (called only on explicit user clicks).
+ * Reverse geocode a point. zoom controls granularity:
+ * 8=state, 10=county, 12=city/suburb, 14=street
  */
-export async function reverseGeocode(lat: number, lng: number): Promise<ReverseResult | null> {
+export async function reverseGeocode(
+  lat: number,
+  lng: number,
+  zoom = 10,
+): Promise<ReverseResult | null> {
   const url =
-    `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=10&addressdetails=1`;
+    `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}` +
+    `&format=json&zoom=${zoom}&addressdetails=1&polygon_geojson=1&polygon_threshold=0.005`;
   try {
     const res = await fetch(url, {
       headers: { 'Accept-Language': 'en', 'User-Agent': 'GeoTargetBuilder/1.0' },
@@ -159,6 +208,7 @@ export async function reverseGeocode(lat: number, lng: number): Promise<ReverseR
       name?: string;
       addresstype?: string;
       type?: string;
+      geojson?: Geometry;
       address?: ReverseResult['address'];
     };
     const addr = data.address ?? {};
@@ -175,6 +225,7 @@ export async function reverseGeocode(lat: number, lng: number): Promise<ReverseR
       displayName: data.display_name ?? '',
       shortName,
       addresstype,
+      geom: data.geojson,
       address: addr,
     };
   } catch {
@@ -183,7 +234,7 @@ export async function reverseGeocode(lat: number, lng: number): Promise<ReverseR
 }
 
 /**
- * Build a location string in Google/Bing Ads format from a reverse geocode result.
+ * Build a location string in Google/Bing Ads format.
  * e.g. "Orange County, California, United States (county)"
  */
 export function reverseResultToLocationString(r: ReverseResult): string {
@@ -204,10 +255,41 @@ export function reverseResultToLocationString(r: ReverseResult): string {
     r.shortName;
 
   const kind =
-    addr.county ? '(county)' :
-    addr.city ? '(city)' :
-    addr.suburb ? '(neighborhood)' :
+    addr.county ? ' (county)' :
+    addr.city ? ' (city)' :
+    addr.suburb ? ' (neighborhood)' :
     '';
 
-  return [place, state, country].filter(Boolean).join(', ') + (kind ? ` ${kind}` : '');
+  return [place, state, country].filter(Boolean).join(', ') + kind;
+}
+
+/**
+ * Build location string from a NominatimSuggestion (for search results).
+ */
+export function suggestionToLocationString(s: NominatimSuggestion): string {
+  const addr = s.address ?? {};
+  const state = addr.state ?? '';
+  const country = addr.country ?? '';
+
+  if (addr.postcode && s.addresstype === 'postcode') {
+    return [addr.postcode, state, country].filter(Boolean).join(', ');
+  }
+
+  const place =
+    addr.county ||
+    addr.city ||
+    addr.town ||
+    addr.village ||
+    addr.suburb ||
+    '';
+
+  if (!place) return s.display_name;
+
+  const kind =
+    addr.county ? ' (county)' :
+    addr.city ? ' (city)' :
+    addr.suburb ? ' (neighborhood)' :
+    '';
+
+  return [place, state, country].filter(Boolean).join(', ') + kind;
 }
